@@ -50,10 +50,28 @@ app.MapPost("/api/sync/push", async (HttpRequest request, CashierDatabase db) =>
 		return Unauthorized();
 	}
 
-	var package = await request.ReadFromJsonAsync<PosSyncPackage>();
-	if (package is null)
+	var document = await request.ReadFromJsonAsync<JsonDocument>();
+	if (document is null)
 	{
 		return Results.BadRequest(new { error = "invalid_sync_package" });
+	}
+
+	if (document.RootElement.TryGetProperty("Items", out _))
+	{
+		var outboxRequest = document.Deserialize<OutboxPushRequest>();
+		if (outboxRequest is null)
+		{
+			return Results.BadRequest(new { error = "invalid_outbox_package" });
+		}
+
+		var outboxResult = await db.MergeOutboxAsync(outboxRequest);
+		return Results.Ok(outboxResult);
+	}
+
+	var package = document.Deserialize<PosSyncPackage>();
+	if (package is null)
+	{
+		return Results.BadRequest(new { error = "invalid_pos_package" });
 	}
 
 	var result = await db.MergeAsync(package);
@@ -81,6 +99,36 @@ app.MapGet("/api/sync/pull", async (HttpRequest request, CashierDatabase db) =>
 app.MapGet("/api/reports/summary", async (HttpRequest request, CashierDatabase db) =>
 {
 	if (!IsAuthorized(request))
+	{
+		return Unauthorized();
+	}
+
+	var state = await db.ReadAsync();
+	var today = DateTime.Today;
+	var monthStart = new DateTime(today.Year, today.Month, 1);
+	var todaySales = state.Sales.Where(sale => sale.CreatedAt.Date == today).ToList();
+	var monthSales = state.Sales.Where(sale => sale.CreatedAt.Date >= monthStart).ToList();
+
+	decimal Profit(Sale sale) => sale.Items.Sum(item => item.LineTotal - item.UnitCost * item.Quantity) - sale.Discount;
+
+	return Results.Ok(new
+	{
+		todaySales = todaySales.Sum(sale => sale.Total),
+		todayProfit = todaySales.Sum(Profit),
+		monthSales = monthSales.Sum(sale => sale.Total),
+		monthProfit = monthSales.Sum(Profit),
+		inventoryValue = state.Products.Sum(product => product.Stock * product.Cost),
+		lowStockCount = state.Products.Count(product => product.Stock <= 5),
+		productCount = state.Products.Count,
+		saleCount = state.Sales.Count,
+		lastUpdatedAt = state.UpdatedAt
+	});
+});
+
+app.MapGet("/api/dashboard/summary", async (HttpRequest request, CashierDatabase db) =>
+{
+	var apiKey = request.Query["apiKey"].ToString();
+	if (!string.Equals(apiKey, apiToken, StringComparison.Ordinal))
 	{
 		return Unauthorized();
 	}
@@ -200,6 +248,205 @@ public sealed class CashierDatabase
 		}
 	}
 
+	public async Task<OutboxPushResponse> MergeOutboxAsync(OutboxPushRequest request)
+	{
+		await gate.WaitAsync();
+		try
+		{
+			var state = await ReadUnsafeAsync();
+			var accepted = new List<long>();
+			var failed = new List<long>();
+
+			foreach (var item in request.Items)
+			{
+				try
+				{
+					switch (item.EntityName)
+					{
+						case "Products":
+							ApplyProductOutboxItem(state, item);
+							accepted.Add(item.SyncId);
+							break;
+						case "SalesInvoice":
+							ApplySalesInvoiceOutboxItem(state, item, request.DeviceId);
+							accepted.Add(item.SyncId);
+							break;
+						default:
+							failed.Add(item.SyncId);
+							break;
+					}
+				}
+				catch
+				{
+					failed.Add(item.SyncId);
+				}
+			}
+
+			state.UpdatedAt = DateTime.UtcNow;
+			await WriteUnsafeAsync(state);
+
+			return new OutboxPushResponse
+			{
+				Success = failed.Count == 0,
+				AcceptedSyncIds = accepted,
+				FailedSyncIds = failed
+			};
+		}
+		finally
+		{
+			gate.Release();
+		}
+	}
+
+	private static void ApplyProductOutboxItem(CloudState state, CloudSyncItem item)
+	{
+		using var document = JsonDocument.Parse(item.PayloadJson);
+		var root = document.RootElement;
+
+		var productId = GetString(root, "ProductId", item.EntityId ?? string.Empty);
+		var barcode = GetString(root, "Barcode");
+
+		if (string.Equals(item.ActionName, "Delete", StringComparison.OrdinalIgnoreCase))
+		{
+			state.Products.RemoveAll(product => product.Id == productId || (!string.IsNullOrWhiteSpace(barcode) && product.Barcode == barcode));
+			return;
+		}
+
+		var existing = state.Products.FirstOrDefault(product => product.Id == productId)
+			?? state.Products.FirstOrDefault(product => !string.IsNullOrWhiteSpace(barcode)
+				&& product.Barcode.Equals(barcode, StringComparison.OrdinalIgnoreCase));
+
+		var updatedAt = GetDateTime(root, "UpdatedAtUtc", DateTime.UtcNow);
+		if (existing is null)
+		{
+			state.Products.Add(new Product
+			{
+				Id = productId,
+				Name = FirstNonEmpty(GetString(root, "NameAr"), GetString(root, "NameEn"), barcode, productId),
+				Barcode = barcode,
+				Category = GetString(root, "Category", "عام"),
+				Price = GetDecimal(root, "Price"),
+				Cost = GetDecimal(root, "CostPrice"),
+				Stock = GetDecimal(root, "Quantity"),
+				UpdatedAt = updatedAt
+			});
+			return;
+		}
+
+		if (updatedAt < existing.UpdatedAt)
+		{
+			return;
+		}
+
+		existing.Name = FirstNonEmpty(GetString(root, "NameAr"), GetString(root, "NameEn"), existing.Name);
+		existing.Barcode = barcode;
+		existing.Category = GetString(root, "Category", existing.Category);
+		existing.Price = GetDecimal(root, "Price");
+		existing.Cost = GetDecimal(root, "CostPrice");
+		existing.Stock = GetDecimal(root, "Quantity");
+		existing.UpdatedAt = updatedAt;
+	}
+
+	private static void ApplySalesInvoiceOutboxItem(CloudState state, CloudSyncItem item, string deviceId)
+	{
+		using var document = JsonDocument.Parse(item.PayloadJson);
+		var root = document.RootElement;
+		var invoiceId = GetString(root, "InvoiceId", item.EntityId ?? string.Empty);
+		var isNewSale = state.Sales.All(sale => sale.Id != invoiceId);
+
+		state.Sales.RemoveAll(sale => sale.Id == invoiceId);
+
+		var items = new List<SaleItem>();
+		if (root.TryGetProperty("Items", out var itemsElement) && itemsElement.ValueKind == JsonValueKind.Array)
+		{
+			foreach (var line in itemsElement.EnumerateArray())
+			{
+				var barcode = GetString(line, "Barcode");
+				var productName = GetString(line, "ProductName", barcode);
+				var quantity = GetDecimal(line, "Quantity");
+				var price = GetDecimal(line, "Price");
+				var unitCost = GetDecimal(line, "PurchasePrice");
+				var discount = GetDecimal(line, "Discount");
+				var lineTotal = GetDecimal(line, "Total", quantity * price - discount);
+
+				items.Add(new SaleItem
+				{
+					ProductId = barcode,
+					Name = productName,
+					Quantity = quantity,
+					UnitPrice = price,
+					UnitCost = unitCost,
+					LineTotal = lineTotal
+				});
+
+				var product = state.Products.FirstOrDefault(product => !string.IsNullOrWhiteSpace(barcode)
+					&& product.Barcode.Equals(barcode, StringComparison.OrdinalIgnoreCase));
+				if (product is not null && isNewSale)
+				{
+					product.Stock -= quantity;
+					product.UpdatedAt = DateTime.UtcNow;
+				}
+			}
+		}
+
+		state.Sales.Add(new Sale
+		{
+			Id = invoiceId,
+			DeviceId = deviceId,
+			InvoiceNumber = GetString(root, "InvoiceNumber", invoiceId).TrimStart('#'),
+			CreatedAt = GetDateTime(root, "InvoiceDate", DateTime.UtcNow),
+			CustomerName = GetString(root, "CustomerName"),
+			PaymentMethod = GetString(root, "PaymentType", "Cash"),
+			Subtotal = items.Sum(line => line.LineTotal),
+			Discount = 0,
+			Tax = 0,
+			Total = GetDecimal(root, "NetAmount", items.Sum(line => line.LineTotal)),
+			IsSynced = true,
+			SyncVersion = 1,
+			Items = items
+		});
+	}
+
+	private static string GetString(JsonElement element, string propertyName, string defaultValue = "")
+	{
+		if (!element.TryGetProperty(propertyName, out var property) || property.ValueKind is JsonValueKind.Null or JsonValueKind.Undefined)
+		{
+			return defaultValue;
+		}
+
+		return property.ToString() ?? defaultValue;
+	}
+
+	private static decimal GetDecimal(JsonElement element, string propertyName, decimal defaultValue = 0)
+	{
+		if (!element.TryGetProperty(propertyName, out var property))
+		{
+			return defaultValue;
+		}
+
+		if (property.ValueKind == JsonValueKind.Number && property.TryGetDecimal(out var value))
+		{
+			return value;
+		}
+
+		return decimal.TryParse(property.ToString(), out var parsed) ? parsed : defaultValue;
+	}
+
+	private static DateTime GetDateTime(JsonElement element, string propertyName, DateTime defaultValue)
+	{
+		if (!element.TryGetProperty(propertyName, out var property))
+		{
+			return defaultValue;
+		}
+
+		return DateTime.TryParse(property.ToString(), out var parsed) ? parsed : defaultValue;
+	}
+
+	private static string FirstNonEmpty(params string[] values)
+	{
+		return values.FirstOrDefault(value => !string.IsNullOrWhiteSpace(value)) ?? string.Empty;
+	}
+
 	private async Task<CloudState> ReadUnsafeAsync()
 	{
 		if (!File.Exists(dbPath))
@@ -229,6 +476,29 @@ public sealed class SyncResult
 	public int UpdatedProducts { get; set; }
 	public int AddedSales { get; set; }
 	public DateTime ServerTime { get; set; }
+}
+
+public sealed class OutboxPushRequest
+{
+	public string DeviceId { get; set; } = string.Empty;
+	public List<CloudSyncItem> Items { get; set; } = [];
+}
+
+public sealed class CloudSyncItem
+{
+	public long SyncId { get; set; }
+	public string EntityName { get; set; } = string.Empty;
+	public string? EntityId { get; set; }
+	public string ActionName { get; set; } = string.Empty;
+	public string PayloadJson { get; set; } = string.Empty;
+	public string CreatedAt { get; set; } = string.Empty;
+}
+
+public sealed class OutboxPushResponse
+{
+	public bool Success { get; set; }
+	public List<long> AcceptedSyncIds { get; set; } = [];
+	public List<long> FailedSyncIds { get; set; } = [];
 }
 
 public sealed class CloudState
