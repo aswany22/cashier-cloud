@@ -17,6 +17,10 @@ var app = builder.Build();
 app.UseCors();
 
 var apiToken = app.Configuration["ApiToken"] ?? "change-me-123";
+var apiJsonOptions = new JsonSerializerOptions(JsonSerializerDefaults.Web)
+{
+	PropertyNameCaseInsensitive = true
+};
 
 bool IsAuthorized(HttpRequest request)
 {
@@ -56,9 +60,10 @@ app.MapPost("/api/sync/push", async (HttpRequest request, CashierDatabase db) =>
 		return Results.BadRequest(new { error = "invalid_sync_package" });
 	}
 
-	if (document.RootElement.TryGetProperty("Items", out _))
+if (document.RootElement.TryGetProperty("Items", out _) ||
+	document.RootElement.TryGetProperty("items", out _))
 	{
-		var outboxRequest = document.Deserialize<OutboxPushRequest>();
+		var outboxRequest = document.Deserialize<OutboxPushRequest>(apiJsonOptions);
 		if (outboxRequest is null)
 		{
 			return Results.BadRequest(new { error = "invalid_outbox_package" });
@@ -68,7 +73,7 @@ app.MapPost("/api/sync/push", async (HttpRequest request, CashierDatabase db) =>
 		return Results.Ok(outboxResult);
 	}
 
-	var package = document.Deserialize<PosSyncPackage>();
+	var package = document.Deserialize<PosSyncPackage>(apiJsonOptions);
 	if (package is null)
 	{
 		return Results.BadRequest(new { error = "invalid_pos_package" });
